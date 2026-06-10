@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Same stylized sakura petal as assets/logo.svg -->
+    <path id="petal"
+      d="M 0 -36
+         C -40 -52, -62 -104, -54 -152
+         C -49 -180, -29 -196, -13 -186
+         C -6 -181, -2 -172, 0 -162
+         C 2 -172, 6 -181, 13 -186
+         C 29 -196, 49 -180, 54 -152
+         C 62 -104, 40 -52, 0 -36
+         Z"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c1c22"/>
+      <stop offset="1" stop-color="#131317"/>
+    </linearGradient>
+  </defs>
+
+  <!-- dark neutral background, matching the logo badge -->
+  <rect x="0" y="0" width="1280" height="640" fill="url(#bg)"/>
+
+  <!-- drifting petals, very faint -->
+  <g fill="#f5a8c0">
+    <use href="#petal" transform="translate(1290 420) rotate(-70) scale(2.6)" opacity="0.05"/>
+    <use href="#petal" transform="translate(1120 150) rotate(38) scale(0.85)" opacity="0.10"/>
+    <use href="#petal" transform="translate(1205 555) rotate(-28) scale(0.6)" opacity="0.09"/>
+    <use href="#petal" transform="translate(760 95) rotate(112) scale(0.5)" opacity="0.07"/>
+    <use href="#petal" transform="translate(925 600) rotate(155) scale(0.45)" opacity="0.07"/>
+    <use href="#petal" transform="translate(70 640) rotate(64) scale(0.7)" opacity="0.08"/>
+    <use href="#petal" transform="translate(620 460) rotate(-140) scale(0.35)" opacity="0.06"/>
+  </g>
+
+  <!-- soft halo behind the blossom -->
+  <circle cx="310" cy="320" r="255" fill="#f5a8c0" opacity="0.04"/>
+
+  <!-- blossom mark, same construction as the logo -->
+  <g transform="translate(310 320) scale(1.15)">
+    <g fill="#f5a8c0">
+      <use href="#petal"/>
+      <use href="#petal" transform="rotate(72)"/>
+      <use href="#petal" transform="rotate(144)"/>
+      <use href="#petal" transform="rotate(216)"/>
+      <use href="#petal" transform="rotate(288)"/>
+    </g>
+    <circle r="12" fill="#d4778f"/>
+    <g fill="#d4778f">
+      <circle cx="0" cy="-44" r="7"/>
+      <circle cx="41.8" cy="-13.6" r="7"/>
+      <circle cx="25.9" cy="35.6" r="7"/>
+      <circle cx="-25.9" cy="35.6" r="7"/>
+      <circle cx="-41.8" cy="-13.6" r="7"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="600" y="308"
+        font-family="JetBrainsMono Nerd Font"
+        font-size="140" font-weight="500"
+        letter-spacing="12"
+        fill="#e9e7e4">sakura</text>
+
+  <!-- tagline -->
+  <text x="604" y="382"
+        font-family="JetBrainsMono Nerd Font"
+        font-size="33" font-weight="400"
+        letter-spacing="1"
+        fill="#8d8b96">A simple, fast and small</text>
+  <text x="604" y="432"
+        font-family="JetBrainsMono Nerd Font"
+        font-size="33" font-weight="400"
+        letter-spacing="1"
+        fill="#8d8b96"><tspan fill="#f5a8c0">Blossom</tspan> server written in <tspan fill="#f5a8c0">Odin</tspan></text>
+</svg>

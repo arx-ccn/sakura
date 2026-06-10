@@ -1,0 +1,9 @@
+# keep the build context tiny — only source goes to the daemon
+data/
+sakura
+sakura-static
+*.o
+*.tar.gz
+.git/
+tests/
+*.md
