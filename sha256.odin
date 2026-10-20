@@ -5,15 +5,16 @@ package sakura
 // The hot path here is the compression function. Hashing an uploaded blob is
 // the single most expensive per-request operation besides the signature check.
 //
-// Two block implementations live here:
+// Two compression implementations live here:
 //
-//   * sha256_block_simd  — uses the x86 SHA extensions (SHA-NI:
-//     sha256rnds2 / sha256msg1 / sha256msg2). ~10x the scalar version.
+//   * sha256_blocks_ni — the x86 SHA extensions (SHA-NI: sha256rnds2 /
+//     sha256msg1 / sha256msg2). The state stays in two xmm registers across
+//     every block of a call, so large inputs stream at ~2.3 GB/s.
 //   * sha256_block_scalar — a fully unrolled FIPS reference compression
 //     function with byte-swap loads. Used everywhere SHA-NI is unavailable.
 //
 // At first use we probe CPUID (leaf 7, EBX bit 29) once and cache the result;
-// every block then dispatches through the cached flag. Everything is
+// each run of blocks then dispatches through the cached flag. Everything is
 // contextless and allocation-free so the callers (themselves contextless)
 // can use it from any thread without a context.
 
@@ -28,6 +29,7 @@ Sha256_Ctx :: struct {
 }
 
 @(private = "file")
+@(rodata)
 SHA256_K := [64]u32{
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
 	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -82,15 +84,18 @@ have_sha_ni :: #force_inline proc "contextless" () -> bool {
 	return s == 1
 }
 
+// Compress every whole 64-byte block of data into state.
 @(private = "file")
-sha256_block :: #force_inline proc "contextless" (state: ^[8]u32, block: []u8) {
+sha256_blocks :: proc "contextless" (state: ^[8]u32, data: []u8) {
 	when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
 		if have_sha_ni() {
-			sha256_block_simd(state, block)
+			sha256_blocks_ni(state, data)
 			return
 		}
 	}
-	sha256_block_scalar(state, block)
+	for off := 0; off + 64 <= len(data); off += 64 {
+		sha256_block_scalar(state, data[off:off + 64])
+	}
 }
 
 // --- Scalar (portable fallback) ---------------------------------------------
@@ -161,29 +166,23 @@ sha256_block_scalar :: proc "contextless" (state: ^[8]u32, block: []u8) {
 
 // --- SHA-NI (x86 SHA extensions) --------------------------------------------
 //
-// Intel's canonical single-block sequence. The eight working words are held in
-// two 128-bit registers in the order sha256rnds2 expects:
+// Intel's canonical sequence. The eight working words are held in two 128-bit
+// registers in the order sha256rnds2 expects:
 //
 //   STATE0 = { A, B, E, F }   (dword3=A .. dword0=F, big-endian-of-register)
 //   STATE1 = { C, D, G, H }
 //
-// We assemble those once from the incoming state, run all 64 rounds (two per
+// We assemble those once per call, run all 64 rounds of each block (two per
 // sha256rnds2, with sha256msg1/msg2 extending the 16-word window in four
-// __m128i lanes), then add the result back into the saved state. K constants
-// are pre-added to the message words before each rnds2 pair.
+// __m128i lanes), add the block's result into the running registers, and
+// write the state back once at the end. K constants are pre-added to the
+// message words before each rnds2 pair.
 
-// K as little-endian dword pairs for _mm_set_epi32(e3,e2,e1,e0): e0 is lane 0.
-// For a group starting at round i we need lanes {K[i],K[i+1],K[i+2],K[i+3]}
-// with K[i] in lane0, so call _mm_set_epi32(K[i+3], K[i+2], K[i+1], K[i+0]).
+// K[i..i+3] with K[i] in lane 0: a plain load from the table.
 @(private = "file")
 @(enable_target_feature = "sse2")
 kvec :: #force_inline proc "contextless" (#any_int i: int) -> x86.__m128i {
-	#no_bounds_check {
-		return x86._mm_set_epi32(
-			i32(SHA256_K[i + 3]), i32(SHA256_K[i + 2]),
-			i32(SHA256_K[i + 1]), i32(SHA256_K[i + 0]),
-		)
-	}
+	#no_bounds_check return x86._mm_loadu_si128(transmute(^x86.__m128i)(&SHA256_K[i]))
 }
 
 // Two compression rounds via sha256rnds2 (low dwords of msg = K+W for the two
@@ -213,7 +212,7 @@ sched :: #force_inline proc "contextless" (
 
 @(private = "file")
 @(enable_target_feature = "sse2,ssse3,sse4.1,sha")
-sha256_block_simd :: proc "contextless" (state: ^[8]u32, block: []u8) {
+sha256_blocks_ni :: proc "contextless" (state: ^[8]u32, data: []u8) {
 	#no_bounds_check {
 		// Byte-swap mask: turns a 16-byte big-endian message chunk into four
 		// host-endian dwords.
@@ -228,66 +227,68 @@ sha256_block_simd :: proc "contextless" (state: ^[8]u32, block: []u8) {
 		state0 := x86._mm_alignr_epi8(t, u, 8)        // A B E F
 		state1 := x86._mm_blend_epi16(u, t, 0xF0)     // C D G H
 
-		save0 := state0
-		save1 := state1
+		for off := 0; off + 64 <= len(data); off += 64 {
+			save0 := state0
+			save1 := state1
 
-		// Load + byte-swap the 4 message lanes.
-		m0 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&block[0])), mask)
-		m1 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&block[16])), mask)
-		m2 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&block[32])), mask)
-		m3 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&block[48])), mask)
+			// Load + byte-swap the 4 message lanes.
+			m0 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&data[off])), mask)
+			m1 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&data[off + 16])), mask)
+			m2 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&data[off + 32])), mask)
+			m3 := x86._mm_shuffle_epi8(x86._mm_loadu_si128(transmute(^x86.__m128i)(&data[off + 48])), mask)
 
-		msg, tmp: x86.__m128i
+			msg, tmp: x86.__m128i
 
-		// Rounds 0-3
-		msg = x86._mm_add_epi32(m0, kvec(0))
-		sha_do2(&state0, &state1, msg)
-		// Rounds 4-7
-		msg = x86._mm_add_epi32(m1, kvec(4))
-		sha_do2(&state0, &state1, msg)
-		m0 = x86._mm_sha256msg1_epu32(m0, m1)
-		// Rounds 8-11
-		msg = x86._mm_add_epi32(m2, kvec(8))
-		sha_do2(&state0, &state1, msg)
-		m1 = x86._mm_sha256msg1_epu32(m1, m2)
-		// Rounds 12-15
-		msg = x86._mm_add_epi32(m3, kvec(12))
-		tmp = x86._mm_alignr_epi8(m3, m2, 4)
-		m0 = x86._mm_add_epi32(m0, tmp)
-		m0 = x86._mm_sha256msg2_epu32(m0, m3)
-		sha_do2(&state0, &state1, msg)
-		m2 = x86._mm_sha256msg1_epu32(m2, m3)
+			// Rounds 0-3
+			msg = x86._mm_add_epi32(m0, kvec(0))
+			sha_do2(&state0, &state1, msg)
+			// Rounds 4-7
+			msg = x86._mm_add_epi32(m1, kvec(4))
+			sha_do2(&state0, &state1, msg)
+			m0 = x86._mm_sha256msg1_epu32(m0, m1)
+			// Rounds 8-11
+			msg = x86._mm_add_epi32(m2, kvec(8))
+			sha_do2(&state0, &state1, msg)
+			m1 = x86._mm_sha256msg1_epu32(m1, m2)
+			// Rounds 12-15
+			msg = x86._mm_add_epi32(m3, kvec(12))
+			tmp = x86._mm_alignr_epi8(m3, m2, 4)
+			m0 = x86._mm_add_epi32(m0, tmp)
+			m0 = x86._mm_sha256msg2_epu32(m0, m3)
+			sha_do2(&state0, &state1, msg)
+			m2 = x86._mm_sha256msg1_epu32(m2, m3)
 
-		// Rounds 16-51: identical body with the four lanes rotated by one each
-		// group (m0->m1->m2->m3->m0).
-		sched(&m0, &m1, &m2, &m3, 16, &state0, &state1)
-		sched(&m1, &m2, &m3, &m0, 20, &state0, &state1)
-		sched(&m2, &m3, &m0, &m1, 24, &state0, &state1)
-		sched(&m3, &m0, &m1, &m2, 28, &state0, &state1)
-		sched(&m0, &m1, &m2, &m3, 32, &state0, &state1)
-		sched(&m1, &m2, &m3, &m0, 36, &state0, &state1)
-		sched(&m2, &m3, &m0, &m1, 40, &state0, &state1)
-		sched(&m3, &m0, &m1, &m2, 44, &state0, &state1)
-		sched(&m0, &m1, &m2, &m3, 48, &state0, &state1)
+			// Rounds 16-51: identical body with the four lanes rotated by one
+			// each group (m0->m1->m2->m3->m0).
+			sched(&m0, &m1, &m2, &m3, 16, &state0, &state1)
+			sched(&m1, &m2, &m3, &m0, 20, &state0, &state1)
+			sched(&m2, &m3, &m0, &m1, 24, &state0, &state1)
+			sched(&m3, &m0, &m1, &m2, 28, &state0, &state1)
+			sched(&m0, &m1, &m2, &m3, 32, &state0, &state1)
+			sched(&m1, &m2, &m3, &m0, 36, &state0, &state1)
+			sched(&m2, &m3, &m0, &m1, 40, &state0, &state1)
+			sched(&m3, &m0, &m1, &m2, 44, &state0, &state1)
+			sched(&m0, &m1, &m2, &m3, 48, &state0, &state1)
 
-		// Rounds 52-55: msg2 only (no further msg1 needed).
-		msg = x86._mm_add_epi32(m1, kvec(52))
-		tmp = x86._mm_alignr_epi8(m1, m0, 4)
-		m2 = x86._mm_add_epi32(m2, tmp)
-		m2 = x86._mm_sha256msg2_epu32(m2, m1)
-		sha_do2(&state0, &state1, msg)
-		// Rounds 56-59
-		msg = x86._mm_add_epi32(m2, kvec(56))
-		tmp = x86._mm_alignr_epi8(m2, m1, 4)
-		m3 = x86._mm_add_epi32(m3, tmp)
-		m3 = x86._mm_sha256msg2_epu32(m3, m2)
-		sha_do2(&state0, &state1, msg)
-		// Rounds 60-63
-		msg = x86._mm_add_epi32(m3, kvec(60))
-		sha_do2(&state0, &state1, msg)
+			// Rounds 52-55: msg2 only (no further msg1 needed).
+			msg = x86._mm_add_epi32(m1, kvec(52))
+			tmp = x86._mm_alignr_epi8(m1, m0, 4)
+			m2 = x86._mm_add_epi32(m2, tmp)
+			m2 = x86._mm_sha256msg2_epu32(m2, m1)
+			sha_do2(&state0, &state1, msg)
+			// Rounds 56-59
+			msg = x86._mm_add_epi32(m2, kvec(56))
+			tmp = x86._mm_alignr_epi8(m2, m1, 4)
+			m3 = x86._mm_add_epi32(m3, tmp)
+			m3 = x86._mm_sha256msg2_epu32(m3, m2)
+			sha_do2(&state0, &state1, msg)
+			// Rounds 60-63
+			msg = x86._mm_add_epi32(m3, kvec(60))
+			sha_do2(&state0, &state1, msg)
 
-		state0 = x86._mm_add_epi32(state0, save0)
-		state1 = x86._mm_add_epi32(state1, save1)
+			state0 = x86._mm_add_epi32(state0, save0)
+			state1 = x86._mm_add_epi32(state1, save1)
+		}
 
 		// Store the two state regs to scratch and reassemble the 8 words.
 		// In memory order (lane0 first) state0 = {F,E,B,A}, state1 = {H,G,D,C}.
@@ -307,32 +308,35 @@ sha256_block_simd :: proc "contextless" (state: ^[8]u32, block: []u8) {
 }
 
 sha256_update :: proc "contextless" (ctx: ^Sha256_Ctx, data: []u8) {
-	data := data
 	ctx.total += u64(len(data))
+	absorb(ctx, data)
+}
 
+// Buffer and compress data without counting it (finalization pads through
+// here, and padding must not change ctx.total).
+@(private = "file")
+absorb :: proc "contextless" (ctx: ^Sha256_Ctx, data: []u8) {
+	data := data
 	// Fill an existing partial buffer first.
 	if ctx.buf_len > 0 {
-		need := 64 - ctx.buf_len
-		n := min(need, len(data))
+		n := min(64 - ctx.buf_len, len(data))
 		copy(ctx.buf[ctx.buf_len:], data[:n])
 		ctx.buf_len += n
 		data = data[n:]
-		if ctx.buf_len == 64 {
-			sha256_block(&ctx.state, ctx.buf[:])
-			ctx.buf_len = 0
+		if ctx.buf_len < 64 {
+			return
 		}
+		sha256_blocks(&ctx.state, ctx.buf[:])
+		ctx.buf_len = 0
 	}
-
-	// Process full blocks directly from the input.
-	for len(data) >= 64 {
-		sha256_block(&ctx.state, data[:64])
-		data = data[64:]
+	// Whole blocks straight from the input, then stash the remainder.
+	whole := len(data) &~ 63
+	if whole > 0 {
+		sha256_blocks(&ctx.state, data[:whole])
 	}
-
-	// Stash the remainder.
-	if len(data) > 0 {
-		copy(ctx.buf[:], data)
-		ctx.buf_len = len(data)
+	if whole < len(data) {
+		copy(ctx.buf[:], data[whole:])
+		ctx.buf_len = len(data) - whole
 	}
 }
 
@@ -350,41 +354,13 @@ sha256_final :: proc "contextless" (ctx: ^Sha256_Ctx) -> [32]u8 {
 	#no_bounds_check for i in 0 ..< 8 {
 		pad[pad_len + i] = u8(bit_len >> uint(56 - 8 * i))
 	}
-	sha256_update_no_count(ctx, pad[:pad_len + 8])
+	absorb(ctx, pad[:pad_len + 8])
 
 	out: [32]u8 = ---
 	#no_bounds_check for i in 0 ..< 8 {
-		out[i * 4 + 0] = u8(ctx.state[i] >> 24)
-		out[i * 4 + 1] = u8(ctx.state[i] >> 16)
-		out[i * 4 + 2] = u8(ctx.state[i] >> 8)
-		out[i * 4 + 3] = u8(ctx.state[i])
+		intrinsics.unaligned_store((^u32)(&out[i * 4]), intrinsics.byte_swap(ctx.state[i]))
 	}
 	return out
-}
-
-// Padding bytes must not change ctx.total, so finalization uses this variant.
-@(private = "file")
-sha256_update_no_count :: proc "contextless" (ctx: ^Sha256_Ctx, data: []u8) {
-	data := data
-	if ctx.buf_len > 0 {
-		need := 64 - ctx.buf_len
-		n := min(need, len(data))
-		copy(ctx.buf[ctx.buf_len:], data[:n])
-		ctx.buf_len += n
-		data = data[n:]
-		if ctx.buf_len == 64 {
-			sha256_block(&ctx.state, ctx.buf[:])
-			ctx.buf_len = 0
-		}
-	}
-	for len(data) >= 64 {
-		sha256_block(&ctx.state, data[:64])
-		data = data[64:]
-	}
-	if len(data) > 0 {
-		copy(ctx.buf[:], data)
-		ctx.buf_len = len(data)
-	}
 }
 
 // One-shot helper.

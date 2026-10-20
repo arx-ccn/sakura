@@ -1,5 +1,7 @@
 package sakura
 
+import "base:intrinsics"
+import "core:simd"
 import "core:strconv"
 import "core:strings"
 
@@ -22,14 +24,18 @@ Json :: union {
 	map[string]Json,
 }
 
-@(private = "file")
-Parser :: struct {
+// Read position in a JSON text. json_parse walks it internally; callers that
+// know their schema (Nostr events) drive it directly with json_skip_ws,
+// json_string, json_int and json_value, skipping the tree and its maps.
+Json_Cursor :: struct {
 	s:   string,
 	pos: int,
 }
 
-@(private = "file")
-skip_ws :: proc(p: ^Parser) {
+@(private = "file") QUOTE16 :: #simd[16]u8{0 ..< 16 = '"'}
+@(private = "file") BACKSLASH16 :: #simd[16]u8{0 ..< 16 = '\\'}
+
+json_skip_ws :: proc(p: ^Json_Cursor) {
 	for p.pos < len(p.s) {
 		switch p.s[p.pos] {
 		case ' ', '\t', '\n', '\r':
@@ -42,19 +48,18 @@ skip_ws :: proc(p: ^Parser) {
 
 json_parse :: proc(s: string, allocator := context.allocator) -> (Json, bool) {
 	context.allocator = allocator
-	p := Parser{s, 0}
-	skip_ws(&p)
-	v, ok := parse_value(&p)
+	p := Json_Cursor{s, 0}
+	json_skip_ws(&p)
+	v, ok := json_value(&p)
 	if !ok {
 		return nil, false
 	}
-	skip_ws(&p)
+	json_skip_ws(&p)
 	return v, true
 }
 
-@(private = "file")
-parse_value :: proc(p: ^Parser) -> (Json, bool) {
-	skip_ws(p)
+json_value :: proc(p: ^Json_Cursor) -> (Json, bool) {
+	json_skip_ws(p)
 	if p.pos >= len(p.s) {
 		return nil, false
 	}
@@ -64,7 +69,7 @@ parse_value :: proc(p: ^Parser) -> (Json, bool) {
 	case '[':
 		return parse_array(p)
 	case '"':
-		str, ok := parse_string(p)
+		str, ok := json_string(p)
 		return str, ok
 	case 't':
 		if has_lit(p, "true") {p.pos += 4; return true, true}
@@ -82,7 +87,7 @@ parse_value :: proc(p: ^Parser) -> (Json, bool) {
 
 // Match a literal at the current position without constructing a substring.
 @(private = "file")
-has_lit :: proc(p: ^Parser, lit: string) -> bool {
+has_lit :: proc(p: ^Json_Cursor, lit: string) -> bool {
 	if p.pos + len(lit) > len(p.s) {
 		return false
 	}
@@ -95,11 +100,11 @@ has_lit :: proc(p: ^Parser, lit: string) -> bool {
 }
 
 @(private = "file")
-parse_number :: proc(p: ^Parser) -> (Json, bool) {
+parse_number :: proc(p: ^Json_Cursor) -> (Json, bool) {
 	start := p.pos
 	for p.pos < len(p.s) {
 		c := p.s[p.pos]
-		if (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' {
+		if is_number_byte(c) {
 			p.pos += 1
 		} else {
 			break
@@ -115,8 +120,39 @@ parse_number :: proc(p: ^Parser) -> (Json, bool) {
 	return v, true
 }
 
+// A JSON number truncated to i64, exactly as i64(<json_value's f64>), but
+// without strconv for plain integers short enough to be exact in an f64.
+json_int :: proc(p: ^Json_Cursor) -> (i64, bool) {
+	start := p.pos
+	neg := p.pos < len(p.s) && p.s[p.pos] == '-'
+	if neg {
+		p.pos += 1
+	}
+	v: i64
+	digits := 0
+	for p.pos < len(p.s) && p.s[p.pos] >= '0' && p.s[p.pos] <= '9' {
+		v = v * 10 + i64(p.s[p.pos] - '0')
+		p.pos += 1
+		digits += 1
+	}
+	end_ok := p.pos >= len(p.s) || !is_number_byte(p.s[p.pos])
+	if digits > 0 && digits <= 15 && end_ok {
+		return neg ? -v : v, true
+	}
+	p.pos = start
+	f, ok := parse_number(p)
+	if !ok {
+		return 0, false
+	}
+	return i64(f.(f64)), true
+}
+
 @(private = "file")
-parse_string :: proc(p: ^Parser) -> (string, bool) {
+is_number_byte :: proc(c: u8) -> bool {
+	return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E'
+}
+
+json_string :: proc(p: ^Json_Cursor) -> (string, bool) {
 	if p.s[p.pos] != '"' {
 		return "", false
 	}
@@ -126,6 +162,15 @@ parse_string :: proc(p: ^Parser) -> (string, bool) {
 	// Zero-copy fast path: scan to the closing quote. If no backslash escape
 	// occurs, the string is a verbatim slice of the input (no allocation).
 	// Control characters are tolerated, matching the builder path's behavior.
+	// Whole 16-byte chunks free of '"' and '\' are skipped first.
+	#no_bounds_check for p.pos + 16 <= len(p.s) {
+		v := intrinsics.unaligned_load((^#simd[16]u8)(&raw_data(p.s)[p.pos]))
+		hit := simd.lanes_eq(v, QUOTE16) | simd.lanes_eq(v, BACKSLASH16)
+		if simd.reduce_or(hit) != 0 {
+			break
+		}
+		p.pos += 16
+	}
 	for p.pos < len(p.s) {
 		c := p.s[p.pos]
 		if c == '"' {
@@ -197,7 +242,7 @@ parse_string :: proc(p: ^Parser) -> (string, bool) {
 }
 
 @(private = "file")
-parse_hex4 :: proc(p: ^Parser) -> (u32, bool) {
+parse_hex4 :: proc(p: ^Json_Cursor) -> (u32, bool) {
 	if p.pos + 4 > len(p.s) {
 		return 0, false
 	}
@@ -238,21 +283,21 @@ write_utf8 :: proc(b: ^strings.Builder, cp: u32) {
 }
 
 @(private = "file")
-parse_array :: proc(p: ^Parser) -> (Json, bool) {
+parse_array :: proc(p: ^Json_Cursor) -> (Json, bool) {
 	p.pos += 1 // '['
 	arr := make([dynamic]Json)
-	skip_ws(p)
+	json_skip_ws(p)
 	if p.pos < len(p.s) && p.s[p.pos] == ']' {
 		p.pos += 1
 		return arr[:], true
 	}
 	for {
-		v, ok := parse_value(p)
+		v, ok := json_value(p)
 		if !ok {
 			return nil, false
 		}
 		append(&arr, v)
-		skip_ws(p)
+		json_skip_ws(p)
 		if p.pos >= len(p.s) {
 			return nil, false
 		}
@@ -265,34 +310,34 @@ parse_array :: proc(p: ^Parser) -> (Json, bool) {
 }
 
 @(private = "file")
-parse_object :: proc(p: ^Parser) -> (Json, bool) {
+parse_object :: proc(p: ^Json_Cursor) -> (Json, bool) {
 	p.pos += 1 // '{'
 	obj := make(map[string]Json)
-	skip_ws(p)
+	json_skip_ws(p)
 	if p.pos < len(p.s) && p.s[p.pos] == '}' {
 		p.pos += 1
 		return obj, true
 	}
 	for {
-		skip_ws(p)
+		json_skip_ws(p)
 		if p.pos >= len(p.s) || p.s[p.pos] != '"' {
 			return nil, false
 		}
-		key, ok := parse_string(p)
+		key, ok := json_string(p)
 		if !ok {
 			return nil, false
 		}
-		skip_ws(p)
+		json_skip_ws(p)
 		if p.pos >= len(p.s) || p.s[p.pos] != ':' {
 			return nil, false
 		}
 		p.pos += 1
-		v, ok2 := parse_value(p)
+		v, ok2 := json_value(p)
 		if !ok2 {
 			return nil, false
 		}
 		obj[key] = v
-		skip_ws(p)
+		json_skip_ws(p)
 		if p.pos >= len(p.s) {
 			return nil, false
 		}

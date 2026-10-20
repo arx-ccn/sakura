@@ -19,17 +19,31 @@ A simple, fast and small [Blossom](https://github.com/hzrd149/blossom) server wr
 
 ## Performance notes
 
-- Reads are lock-free: `GET`/`HEAD` stat and stream blob files straight off disk
-  in 64 KiB chunks, and the index mutex is only taken for mutations and metadata.
-- Worker threads (one per core) all accept on a single shared listening socket,
-  with HTTP keep-alive and request pipelining.
-- Each request runs on an arena allocator that is reset afterwards, so parsing
-  and response building cause no per-request heap churn.
+- One worker thread per usable CPU, each running its own epoll loop over
+  non-blocking sockets. The main thread accepts and hands connections out
+  round-robin, so a connection never changes threads. Idle connections cost
+  only their buffers and don't hold up anyone else.
+- Each worker caches the blobs it serves. Blobs are immutable, so a cached
+  entry only goes stale when the blob is deleted, and a delete makes every
+  worker drop its cache. A blob up to 16 KiB is kept with a ready-made
+  response header and goes out in one `send`; a larger one keeps an open file
+  descriptor and goes out as the header plus one `sendfile`.
+- The index is split into 256 shards by the hash's first byte, each with its
+  own lock, so lookups of different blobs don't contend.
+- Requests are parsed in place with no allocation. Anything a handler
+  allocates comes from a per-worker arena that is reset between requests.
 - secp256k1 verification is variable-time. It touches only public data, so
-  constant time isn't needed, and dropping it buys speed. Field reduction
-  exploits the `p = 2^256 - 2^32 - 977` shape; scalars and points use 4×`u64`
-  limbs with `u128` intermediates.
-- SHA-256 is streaming and hashes directly out of the upload buffer.
+  constant time isn't needed, and dropping it buys speed. It follows
+  libsecp256k1: 5×52-bit field limbs with lazy reduction, `R = s·G - e·P` in
+  one Strauss-Shamir wNAF pass with `e` split by the GLV endomorphism and `s`
+  against 1 MiB of odd multiples of `G` and `2^128·G` (built once, on first
+  use), safegcd inversion, and `mulx` copies of the hot loop on BMI2 CPUs.
+  Each worker caches the precomputation for recently seen pubkeys and the ids
+  of events it has verified, so a token sent for `HEAD` and then `PUT /upload`
+  is checked once.
+- SHA-256 is streaming and hashes directly out of the upload buffer, with the
+  x86 SHA extensions when the CPU has them (~2.4 GB/s) and a portable
+  fallback otherwise.
 
 ## Build
 
@@ -53,13 +67,13 @@ Configuration (environment variables):
 | `SAKURA_DOMAIN` | _(off)_ | domain for BUD-11 `server`-tag scoping |
 | `SAKURA_PUBLIC_URL` | _(derive from Host)_ | base URL in descriptors |
 | `SAKURA_MAX_MB` | `100` | max blob size (MB) |
-| `SAKURA_WORKERS` | `16` | worker threads |
+| `SAKURA_WORKERS` | one per usable CPU | worker threads |
 | `SAKURA_REQUIRE_AUTH` | `true` | require auth for upload/delete/mirror |
 
 ## Tests
 
 ```sh
-./sakura --selftest      # in-binary known-answer tests (47 checks, exit code = result)
+./sakura --selftest      # in-binary known-answer tests (51 checks, exit code = result)
 ./tests/run.sh           # the above + SHA-256 differential + live HTTP end-to-end
 ```
 
@@ -67,8 +81,10 @@ Configuration (environment variables):
 
 - SHA-256: the canonical KATs (empty, `"abc"`, the two NIST multi-block
   vectors) plus the one-million-`'a'` streaming/padding stress.
-- secp256k1 units: `fe_inv`/`fe_sqrt`/`fe_neg` round-trips, the published
-  x-coordinates of `2G`/`3G`, `(n-1)G == -G`, `2G+G == 3G`, `lift_x(Gx)`.
+- secp256k1 units: `fe_inv`/`fe_sqrt`/`fe_neg`/`fe_half` round-trips,
+  normalization, `(n-1)^2 mod n`, the GLV split, the published x-coordinates
+  of `2G`/`3G`, `(n-1)G == -G`, `2G+G == 3G`, `lambda·G == (beta·Gx, Gy)`,
+  the Strauss-Shamir `a·(7G) + b·G`, `lift_x(Gx)`.
 - BIP-340 verify: all 19 vectors from the spec CSV, including every must-fail
   edge case (off-curve key, `has_even_y(R)` false, negated message/`s`,
   infinite `sG−eP` with `R.x` = 0 and 1, `sig[0:32]` off-curve / `== p`,
@@ -139,14 +155,19 @@ instant.
 | `json.odin` | JSON parser + NIP-01 string escaping |
 | `nostr.odin` | event parsing, id recomputation, BUD-11 validation, token minting |
 | `store.odin` | sharded on-disk blob store + append-only index |
-| `http.odin` | request parser, response/streaming writer |
+| `cache.odin` | per-worker cache of served blobs |
+| `loop.odin` | acceptor, per-worker epoll loops, streaming uploads |
+| `http.odin` | request parser, response writer |
 | `http_client.odin` | minimal HTTP client for `/mirror` |
 | `server.odin` | routing and every endpoint |
-| `main.odin` | config, worker pool, self-test, CLI |
+| `main.odin` | config, startup, self-test, CLI |
 
 ## Limitations
 
 - `/mirror` fetches `http://` sources only; TLS is out of scope for a
   dependency-free build, so `https://` sources return `502`.
+- Uploads are acknowledged once written to the page cache; nothing calls
+  `fsync`, so a power loss can drop the most recent uploads.
+- Linux only: the server uses epoll and sendfile directly.
 - BUD-05 (media optimization), BUD-07 (payments), BUD-08/09/10 are not server
   endpoints and are intentionally out of scope.
