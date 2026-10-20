@@ -1,10 +1,11 @@
 package sakura
 
-import "core:io"
-import "core:os"
+import "base:runtime"
+import "core:mem/virtual"
 import "core:strconv"
 import "core:strings"
 import "core:sys/linux"
+import "core:thread"
 
 Config :: struct {
 	host:         string,
@@ -17,308 +18,215 @@ Config :: struct {
 	require_auth: bool, // require auth for upload/delete/mirror
 }
 
-// Process-wide handles. Workers are stateless and share these.
+// Process-wide handles. Workers share these.
 g_config: ^Config
 g_store: ^Store
 
-// Mirror request bodies are tiny JSON; cap them well below the blob limit.
-MIRROR_BODY_CAP :: 1024 * 1024
-
-// Entry point for every request once parsed. Returns ok=false when the
-// connection must be closed.
-handle_request :: proc(req: ^Request, c: ^Conn) -> bool {
-	now := unix_now()
-
-	if req.method == "__TOOLARGE__" {
-		respond_error(c, 413, "blob exceeds maximum size", false)
-		return false // body was never consumed; close.
-	}
-
+// Entry point for every request whose body (if any) is fully buffered.
+// Responses are queued on `c`; returns .Detached when the connection was
+// handed to another thread.
+handle_request :: proc(c: ^Conn, req: ^Request, body: []u8) -> Conn_End {
 	switch req.method {
-	case "OPTIONS":
-		return respond(c, 204, "", {}, req.keep_alive, {{"Access-Control-Max-Age", "86400"}})
-	case "GET", "HEAD":
-		return handle_read(req, c, req.method == "HEAD", now)
+	case "GET":
+		handle_read(c, req, false)
+	case "HEAD":
+		handle_read(c, req, true)
 	case "PUT":
 		switch req.path {
 		case "/upload":
-			return handle_upload(req, c, now)
+			handle_upload(c, req, body)
 		case "/mirror":
-			return handle_mirror(req, c, now)
+			return mirror_start(c, req, body)
+		case:
+			respond_error(c, 404, "unknown endpoint", req.keep_alive)
 		}
-		// Unknown PUT endpoint: drain the body to keep the connection usable.
-		if !drain_body(req, c) {
-			respond_error(c, 404, "unknown endpoint", false)
-			return false
-		}
-		return respond_error(c, 404, "unknown endpoint", req.keep_alive)
 	case "DELETE":
-		return handle_delete(req, c, now)
+		handle_delete(c, req)
+	case "OPTIONS":
+		respond(c, 204, "", {}, req.keep_alive, {{"Access-Control-Max-Age", "86400"}})
+	case:
+		respond_error(c, 405, "method not allowed", req.keep_alive)
 	}
-	return respond_error(c, 405, "method not allowed", req.keep_alive)
-}
-
-// Discard any unread request body so the connection stays keep-alive correct.
-// Returns false if the connection broke mid-drain (caller should close).
-@(private = "file")
-drain_body :: proc(req: ^Request, c: ^Conn) -> bool {
-	buf: [65536]u8 = ---
-	for !body_done(req) {
-		n, ok := body_read_chunk(c, req, buf[:])
-		if !ok {
-			return false
-		}
-		if n == 0 {
-			break
-		}
-	}
-	return true
+	return .Keep
 }
 
 @(private = "file")
-handle_read :: proc(req: ^Request, c: ^Conn, head_only: bool, now: i64) -> bool {
+handle_read :: proc(c: ^Conn, req: ^Request, head_only: bool) {
 	// HEAD /upload is BUD-06 upload-requirements, not a blob fetch.
 	if head_only && req.path == "/upload" {
-		return handle_upload_head(req, c, now)
+		handle_upload_head(c, req)
+		return
 	}
 	if req.path == "/" {
 		body := "sakura 🌸 a Blossom server\n"
-		return respond(c, 200, "text/plain; charset=utf-8", transmute([]u8)body, req.keep_alive)
+		respond(c, 200, "text/plain; charset=utf-8", transmute([]u8)body, req.keep_alive)
+		return
 	}
 	if strings.has_prefix(req.path, "/list/") {
-		return handle_list(req, c, req.path[6:])
+		handle_list(c, req, req.path[6:])
+		return
 	}
-	return handle_get(req, c, head_only)
+	handle_get(c, req, head_only)
 }
 
 // Extract the sha256 (64 lowercase hex) from a path like "/<hash>.png".
 @(private = "file")
-path_hash :: proc(path: string) -> (string, bool) {
+path_hash :: proc "contextless" (path: string) -> (hash: [32]u8, ok: bool) {
 	s := path
 	if len(s) > 0 && s[0] == '/' {
 		s = s[1:]
 	}
-	if dot := strings.index_byte(s, '.'); dot >= 0 {
+	if dot := index_byte(s, '.'); dot >= 0 {
 		s = s[:dot]
 	}
 	if !is_lower_hex(s, 64) {
-		return "", false
+		return {}, false
 	}
-	return s, true
+	return hash_bin(s)
 }
 
 @(private = "file")
-url_base :: proc(req: ^Request) -> string {
+url_base :: proc(host: string) -> string {
 	if g_config.public_url != "" {
 		return g_config.public_url
 	}
-	host, ok := header_get(req, "host")
-	if !ok {
-		host = "localhost"
-	}
-	return strings.concatenate({"http://", host}, context.temp_allocator)
+	return strings.concatenate({"http://", host == "" ? "localhost" : host})
 }
 
 // --- GET / HEAD /<sha256> -------------------------------------------------
 
 @(private = "file")
-handle_get :: proc(req: ^Request, c: ^Conn, head_only: bool) -> bool {
+handle_get :: proc(c: ^Conn, req: ^Request, head_only: bool) {
 	hash, ok := path_hash(req.path)
 	if !ok {
-		return respond_error(c, 404, "not found", req.keep_alive)
+		respond_error(c, 404, "not found", req.keep_alive)
+		return
 	}
-	path := blob_path(g_store, hash, context.temp_allocator)
-
-	fh, oerr := os.open(path, os.O_RDONLY)
-	if oerr != nil {
-		return respond_error(c, 404, "blob not found", req.keep_alive)
+	blob := cache_get(&c.w.cache, hash)
+	if blob == nil {
+		respond_error(c, 404, "blob not found", req.keep_alive)
+		return
 	}
-	defer os.close(fh)
-	size, _ := os.file_size(fh)
 
-	// Determine content type: stored metadata, else sniff, else octet-stream.
-	mime := "application/octet-stream"
-	if _, m, has := store_meta(g_store, hash); has && m != "" {
-		mime = m
-	} else {
-		sniff: [16]u8
-		n, _ := os.read(fh, sniff[:])
-		os.seek(fh, 0, io.Seek_From.Start)
-		if t := sniff_mime(sniff[:n]); t != "" {
-			mime = t
+	// Whole blob: the cached header block, then bytes or a sendfile.
+	rng, has_range := header_get(req, "range")
+	if !has_range {
+		append(&c.out, ..blob.head)
+		out_str(c, connection_tail(req.keep_alive))
+		c.close_after = !req.keep_alive
+		if !head_only {
+			queue_body(c, blob, 0, blob.size)
 		}
+		return
 	}
 
-	// Range handling (single range only).
-	off: i64 = 0
-	length := size
-	is_range := false
-	if rng, has := header_get(req, "range"); has {
-		if s, e, rok := parse_range(rng, size); rok {
-			off = s
-			length = e - s + 1
-			is_range = true
-		} else {
-			return respond(c, 416, "", {}, req.keep_alive, {{"Content-Range", strings.concatenate({"bytes */", itoa(size)}, context.temp_allocator)}})
-		}
+	// Single byte range.
+	start, end, rok := parse_range(rng, blob.size)
+	if !rok {
+		respond(
+			c,
+			416,
+			"",
+			{},
+			req.keep_alive,
+			{{"Content-Range", strings.concatenate({"bytes */", itoa(blob.size)})}},
+		)
+		return
 	}
-
-	extra := make([dynamic]Header, context.temp_allocator)
-	append(&extra, Header{"Accept-Ranges", "bytes"})
-	code := 200
-	if is_range {
-		code = 206
-		cr := strings.concatenate({"bytes ", itoa(off), "-", itoa(off + length - 1), "/", itoa(size)}, context.temp_allocator)
-		append(&extra, Header{"Content-Range", cr})
-	}
-
-	if !respond_headers(c, code, mime, length, req.keep_alive, extra[:]) {
-		return false
-	}
-	if head_only {
-		return true
-	}
-	return stream_file(c, fh, off, length)
-}
-
-// Stream `length` bytes from `fh` at `off` to the socket. Uses sendfile(2) on
-// Linux (zero-copy), falling back to a read/send loop on error or other OSes.
-@(private = "file")
-stream_file :: proc(c: ^Conn, fh: ^os.File, off: i64, length: i64) -> bool {
-	when ODIN_OS == .Linux {
-		out_fd := linux.Fd(i32(c.sock))
-		in_fd := linux.Fd(i32(os.fd(fh)))
-		offset := off
-		remaining := length
-		for remaining > 0 {
-			count := uint(min(remaining, 1 << 30))
-			n, errno := linux.sendfile(out_fd, in_fd, &offset, count)
-			if errno == .EINTR || errno == .EAGAIN {
-				continue
-			}
-			if errno != .NONE {
-				// Fall back to the portable loop for the remainder.
-				return stream_file_rw(c, fh, offset, remaining)
-			}
-			if n == 0 {
-				return false
-			}
-			remaining -= i64(n)
-		}
-		return true
-	} else {
-		return stream_file_rw(c, fh, off, length)
+	length := end - start + 1
+	cr := strings.concatenate({"bytes ", itoa(start), "-", itoa(end), "/", itoa(blob.size)})
+	respond_headers(
+		c,
+		206,
+		blob.mime,
+		length,
+		req.keep_alive,
+		{{"Accept-Ranges", "bytes"}, {"Content-Range", cr}},
+	)
+	if !head_only {
+		queue_body(c, blob, start, length)
 	}
 }
 
+// Queue `length` bytes of the blob from `off`: copied when inlined, else a
+// sendfile from the cached fd (which the connection keeps a reference to).
 @(private = "file")
-stream_file_rw :: proc(c: ^Conn, fh: ^os.File, off: i64, length: i64) -> bool {
-	if off > 0 {
-		os.seek(fh, off, io.Seek_From.Start)
+queue_body :: proc(c: ^Conn, blob: ^Cached_Blob, off, length: i64) {
+	if length == 0 {
+		return
 	}
-	buf: [65536]u8 = ---
-	remaining := length
-	for remaining > 0 {
-		want := min(i64(len(buf)), remaining)
-		n, rerr := os.read(fh, buf[:want])
-		if rerr != nil || n == 0 {
-			return false
-		}
-		if !send_all(c, buf[:n]) {
-			return false
-		}
-		remaining -= i64(n)
+	if blob.body != nil {
+		append(&c.out, ..blob.body[off:][:length])
+		return
 	}
-	return true
+	blob.file.refs += 1
+	c.file = blob.file
+	c.file_off = off
+	c.file_left = length
 }
 
 // --- PUT /upload ----------------------------------------------------------
 
+// A body small enough to have been buffered whole.
 @(private = "file")
-handle_upload :: proc(req: ^Request, c: ^Conn, now: i64) -> bool {
-	if req.content_length == 0 {
-		return respond_error(c, 400, "empty body", req.keep_alive)
+handle_upload :: proc(c: ^Conn, req: ^Request, body: []u8) {
+	if len(body) == 0 {
+		respond_error(c, 400, "empty body", req.keep_alive)
+		return
 	}
+	upload_store(c, req, sha256(body), sniff_mime(body), body, nil, i64(len(body)))
+}
 
-	// Stream the body: hash it AND write it to a temp file, in 64KB chunks.
-	tmp := tmp_path(g_store, context.temp_allocator)
-	fh, oerr := os.open(tmp, os.O_WRONLY | os.O_CREATE | os.O_TRUNC)
-	if oerr != nil {
-		// Can't open temp; still drain so keep-alive survives.
-		if !drain_body(req, c) {
-			respond_error(c, 500, "failed to store blob", false)
-			return false
+// A streamed body, now complete in `tmp` (see loop.odin).
+upload_finish_file :: proc(
+	c: ^Conn,
+	req: ^Request,
+	digest: [32]u8,
+	tmp: cstring,
+	size: i64,
+	sniffed: string,
+) {
+	upload_store(c, req, digest, sniffed, nil, tmp, size)
+}
+
+// Admission checks and storage, once the body's hash is known. Exactly one of
+// `data` (in memory) and `tmp` (temp file, always consumed) is set.
+@(private = "file")
+upload_store :: proc(
+	c: ^Conn,
+	req: ^Request,
+	digest: [32]u8,
+	sniffed: string,
+	data: []u8,
+	tmp: cstring,
+	size: i64,
+) {
+	d := digest
+	hash := hex_string(d[:])
+
+	refuse :: proc(c: ^Conn, req: ^Request, tmp: cstring, code: int, reason: string) {
+		if tmp != nil {
+			linux.unlink(tmp)
 		}
-		return respond_error(c, 500, "failed to store blob", req.keep_alive)
+		respond_error(c, code, reason, req.keep_alive)
 	}
-
-	ctx: Sha256_Ctx
-	sha256_init(&ctx)
-
-	// Sniff mime from the first chunk.
-	sniffed := ""
-	first := true
-	buf: [65536]u8 = ---
-	total: i64 = 0
-	broke := false
-	for !body_done(req) {
-		n, rok := body_read_chunk(c, req, buf[:])
-		if !rok {
-			broke = true
-			break
-		}
-		if n == 0 {
-			break
-		}
-		chunk := buf[:n]
-		sha256_update(&ctx, chunk)
-		if _, werr := os.write(fh, chunk); werr != nil {
-			os.close(fh)
-			os.remove(tmp)
-			// Body partially consumed and write failed: try to drain rest.
-			if !drain_body(req, c) {
-				respond_error(c, 500, "failed to store blob", false)
-				return false
-			}
-			return respond_error(c, 500, "failed to store blob", req.keep_alive)
-		}
-		if first {
-			if t := sniff_mime(chunk); t != "" {
-				sniffed = t
-			}
-			first = false
-		}
-		total += i64(n)
-	}
-	os.close(fh)
-
-	if broke {
-		// Connection died mid-body; clean up and close.
-		os.remove(tmp)
-		return false
-	}
-
-	digest := sha256_final(&ctx)
-	hash := hex_string(digest[:], context.temp_allocator)
-
-	// At this point the entire body is consumed, so failures below can keep the
-	// connection alive.
 
 	// Optional client-asserted hash must match.
 	if xs, has := header_get(req, "x-sha-256"); has && xs != hash {
-		os.remove(tmp)
-		return respond_error(c, 400, "x-sha-256 does not match body", req.keep_alive)
+		refuse(c, req, tmp, 400, "x-sha-256 does not match body")
+		return
 	}
 
-	pubkey := ""
+	now := unix_now()
+	pubkey: [32]u8
 	if g_config.require_auth {
 		auth, _ := header_get(req, "authorization")
 		res := validate_auth(auth, "upload", hash, false, now, g_config.domain)
 		if !res.ok {
-			os.remove(tmp)
-			return respond_error(c, 401, res.reason, req.keep_alive)
+			refuse(c, req, tmp, 401, res.reason)
+			return
 		}
-		pubkey = res.pubkey
+		pubkey, _ = hash_bin(res.pubkey)
 	}
 
 	// Content type: client header, else sniff, else octet-stream.
@@ -329,53 +237,83 @@ handle_upload :: proc(req: ^Request, c: ^Conn, now: i64) -> bool {
 		mime = sniffed
 	}
 
-	size, uploaded, stored_mime, created, ok := store_put_file(g_store, hash, tmp, total, pubkey, mime, now)
+	stored_size, uploaded: i64
+	stored_mime: string
+	created, ok: bool
+	if tmp != nil {
+		stored_size, uploaded, stored_mime, created, ok = store_put_file(
+			g_store,
+			digest,
+			tmp,
+			size,
+			pubkey,
+			mime,
+			now,
+		)
+	} else {
+		stored_size, uploaded, stored_mime, created, ok = store_put(
+			g_store,
+			digest,
+			data,
+			pubkey,
+			mime,
+			now,
+		)
+	}
 	if !ok {
-		return respond_error(c, 500, "failed to store blob", req.keep_alive)
+		respond_error(c, 500, "failed to store blob", req.keep_alive)
+		return
 	}
 
-	desc := blob_descriptor(url_base(req), hash, size, stored_mime, uploaded)
-	code := created ? 201 : 200
-	return respond(c, code, "application/json", transmute([]u8)desc, req.keep_alive)
+	host, _ := header_get(req, "host")
+	desc := blob_descriptor(url_base(host), hash, stored_size, stored_mime, uploaded)
+	respond(c, created ? 201 : 200, "application/json", transmute([]u8)desc, req.keep_alive)
 }
 
 // --- HEAD /upload (BUD-06) ------------------------------------------------
 
 @(private = "file")
-handle_upload_head :: proc(req: ^Request, c: ^Conn, now: i64) -> bool {
+handle_upload_head :: proc(c: ^Conn, req: ^Request) {
 	xhash, _ := header_get(req, "x-sha-256")
 	if g_config.require_auth {
 		auth, _ := header_get(req, "authorization")
-		res := validate_auth(auth, "upload", xhash, false, now, g_config.domain)
+		res := validate_auth(auth, "upload", xhash, false, unix_now(), g_config.domain)
 		if !res.ok {
-			return respond_error(c, 401, res.reason, req.keep_alive)
+			respond_error(c, 401, res.reason, req.keep_alive)
+			return
 		}
 	}
 	clen, has_len := header_get(req, "x-content-length")
 	if !has_len {
-		return respond_error(c, 411, "missing X-Content-Length", req.keep_alive)
+		respond_error(c, 411, "missing X-Content-Length", req.keep_alive)
+		return
 	}
 	n, ok := strconv.parse_int(clen)
 	if !ok || n < 0 {
-		return respond_error(c, 400, "invalid X-Content-Length", req.keep_alive)
+		respond_error(c, 400, "invalid X-Content-Length", req.keep_alive)
+		return
 	}
 	if n > g_config.max_body {
-		return respond_error(c, 413, "blob exceeds maximum size", req.keep_alive)
+		respond_error(c, 413, "blob exceeds maximum size", req.keep_alive)
+		return
 	}
-	return respond(c, 200, "", {}, req.keep_alive)
+	respond(c, 200, "", {}, req.keep_alive)
 }
 
 // --- GET /list/<pubkey> ---------------------------------------------------
 
 @(private = "file")
-handle_list :: proc(req: ^Request, c: ^Conn, pubkey: string) -> bool {
-	if !is_lower_hex(pubkey, 64) {
-		return respond_error(c, 400, "invalid pubkey", req.keep_alive)
+handle_list :: proc(c: ^Conn, req: ^Request, pubkey: string) {
+	pb, ok := hash_bin(pubkey)
+	if !ok || !is_lower_hex(pubkey, 64) {
+		respond_error(c, 400, "invalid pubkey", req.keep_alive)
+		return
 	}
-	records := store_list(g_store, pubkey, context.temp_allocator)
-	base := url_base(req)
+	records := store_list(g_store, pb)
+	host, _ := header_get(req, "host")
+	base := url_base(host)
 
-	b := strings.builder_make(context.temp_allocator)
+	b := strings.builder_make()
 	strings.write_byte(&b, '[')
 	for r, i in records {
 		if i > 0 {
@@ -384,83 +322,146 @@ handle_list :: proc(req: ^Request, c: ^Conn, pubkey: string) -> bool {
 		write_descriptor(&b, base, r.sha256, r.size, r.mime, r.uploaded)
 	}
 	strings.write_byte(&b, ']')
-	return respond(c, 200, "application/json", transmute([]u8)strings.to_string(b), req.keep_alive)
+	respond(c, 200, "application/json", transmute([]u8)strings.to_string(b), req.keep_alive)
 }
 
 // --- DELETE /<sha256> -----------------------------------------------------
 
 @(private = "file")
-handle_delete :: proc(req: ^Request, c: ^Conn, now: i64) -> bool {
+handle_delete :: proc(c: ^Conn, req: ^Request) {
 	hash, ok := path_hash(req.path)
 	if !ok {
-		return respond_error(c, 404, "not found", req.keep_alive)
+		respond_error(c, 404, "not found", req.keep_alive)
+		return
 	}
 	auth, _ := header_get(req, "authorization")
-	res := validate_auth(auth, "delete", hash, true, now, g_config.domain)
+	hk := hash
+	res := validate_auth(auth, "delete", hex_string(hk[:]), true, unix_now(), g_config.domain)
 	if !res.ok {
-		return respond_error(c, 401, res.reason, req.keep_alive)
+		respond_error(c, 401, res.reason, req.keep_alive)
+		return
 	}
-	if !store_delete(g_store, hash, res.pubkey) {
-		return respond_error(c, 404, "blob not found or not owned", req.keep_alive)
+	pubkey, _ := hash_bin(res.pubkey)
+	if !store_delete(g_store, hash, pubkey) {
+		respond_error(c, 404, "blob not found or not owned", req.keep_alive)
+		return
 	}
-	return respond(c, 200, "", {}, req.keep_alive)
+	respond(c, 200, "", {}, req.keep_alive)
 }
 
 // --- PUT /mirror (BUD-04) -------------------------------------------------
 
+// What the mirror thread needs once the connection's buffers are gone.
 @(private = "file")
-handle_mirror :: proc(req: ^Request, c: ^Conn, now: i64) -> bool {
-	// Mirror bodies are tiny JSON; read the whole thing (capped).
-	body, bok := read_full_body(c, req, MIRROR_BODY_CAP)
-	if !bok {
-		respond_error(c, 413, "mirror request too large", false)
-		return false
-	}
+Mirror_Job :: struct {
+	fd:   linux.Fd,
+	body: []u8,
+	auth: string,
+	host: string,
+}
 
-	j, jok := json_parse(string(body), context.temp_allocator)
+// Mirroring blocks on an outbound fetch, so it runs on its own thread with the
+// socket handed over; the response always closes the connection.
+@(private = "file")
+mirror_start :: proc(c: ^Conn, req: ^Request, body: []u8) -> Conn_End {
+	heap := runtime.heap_allocator()
+	auth, _ := header_get(req, "authorization")
+	host, _ := header_get(req, "host")
+	job := new(Mirror_Job, heap)
+	job.fd = c.fd
+	job.body = clone_bytes(body, heap)
+	job.auth = string(clone_bytes(transmute([]u8)auth, heap))
+	job.host = string(clone_bytes(transmute([]u8)host, heap))
+	conn_detach(c)
+	thread.create_and_start_with_poly_data(job, mirror_main, self_cleanup = true)
+	return .Detached
+}
+
+@(private = "file")
+clone_bytes :: proc(b: []u8, allocator: runtime.Allocator) -> []u8 {
+	out := make([]u8, len(b), allocator)
+	copy(out, b)
+	return out
+}
+
+@(private = "file")
+mirror_main :: proc(job: ^Mirror_Job) {
+	heap := runtime.heap_allocator()
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		linux.close(job.fd)
+		return
+	}
+	context.allocator = virtual.arena_allocator(&arena)
+	context.temp_allocator = context.allocator
+
+	c: Conn
+	c.fd = job.fd
+	c.out = make([dynamic]u8, heap)
+	mirror_handle(&c, job)
+	send_blocking(c.fd, c.out[:])
+	linux.close(c.fd)
+
+	delete(c.out)
+	delete(job.body, heap)
+	delete(job.auth, heap)
+	delete(job.host, heap)
+	free(job, heap)
+	virtual.arena_destroy(&arena)
+}
+
+@(private = "file")
+mirror_handle :: proc(c: ^Conn, job: ^Mirror_Job) {
+	now := unix_now()
+	j, jok := json_parse(string(job.body))
 	if !jok {
-		return respond_error(c, 400, "invalid request body", req.keep_alive)
+		respond_error(c, 400, "invalid request body", false)
+		return
 	}
 	obj, is_obj := j.(map[string]Json)
 	if !is_obj {
-		return respond_error(c, 400, "invalid request body", req.keep_alive)
+		respond_error(c, 400, "invalid request body", false)
+		return
 	}
 	url_val, has_url := obj["url"]
 	url, is_str := url_val.(string)
 	if !has_url || !is_str {
-		return respond_error(c, 400, "missing url", req.keep_alive)
+		respond_error(c, 400, "missing url", false)
+		return
 	}
 
 	// Cheap structural pre-auth BEFORE fetching the remote blob (no signature
 	// check yet — that needs the hash). Rejects obviously bad tokens early so a
 	// large download is never performed for an unauthorized request.
 	if g_config.require_auth {
-		auth, _ := header_get(req, "authorization")
-		if reason, ok := auth_precheck(auth, "upload", now, g_config.domain); !ok {
-			return respond_error(c, 401, reason, req.keep_alive)
+		if reason, ok := auth_precheck(job.auth, "upload", now, g_config.domain); !ok {
+			respond_error(c, 401, reason, false)
+			return
 		}
 	}
 
 	status, ctype, data, fok := http_get(url, g_config.max_body)
 	if !fok {
-		return respond_error(c, 502, "failed to fetch source blob", req.keep_alive)
+		respond_error(c, 502, "failed to fetch source blob", false)
+		return
 	}
 	if status != 200 {
-		return respond_error(c, 502, "source returned non-200", req.keep_alive)
+		respond_error(c, 502, "source returned non-200", false)
+		return
 	}
 
 	digest := sha256(data)
-	hash := hex_string(digest[:], context.temp_allocator)
+	hash := hex_string(digest[:])
 
-	pubkey := ""
+	pubkey: [32]u8
 	if g_config.require_auth {
-		auth, _ := header_get(req, "authorization")
 		// Mirror reuses the upload authorization; the x tag must match.
-		res := validate_auth(auth, "upload", hash, true, now, g_config.domain)
+		res := validate_auth(job.auth, "upload", hash, true, now, g_config.domain)
 		if !res.ok {
-			return respond_error(c, 401, res.reason, req.keep_alive)
+			respond_error(c, 401, res.reason, false)
+			return
 		}
-		pubkey = res.pubkey
+		pubkey, _ = hash_bin(res.pubkey)
 	}
 
 	mime := "application/octet-stream"
@@ -470,21 +471,27 @@ handle_mirror :: proc(req: ^Request, c: ^Conn, now: i64) -> bool {
 		mime = t
 	}
 
-	size, uploaded, stored_mime, created, ok := store_put(g_store, hash, data, pubkey, mime, now)
+	size, uploaded, stored_mime, created, ok := store_put(g_store, digest, data, pubkey, mime, now)
 	if !ok {
-		return respond_error(c, 500, "failed to store blob", req.keep_alive)
+		respond_error(c, 500, "failed to store blob", false)
+		return
 	}
-	desc := blob_descriptor(url_base(req), hash, size, stored_mime, uploaded)
-	code := created ? 201 : 200
-	return respond(c, code, "application/json", transmute([]u8)desc, req.keep_alive)
+	desc := blob_descriptor(url_base(job.host), hash, size, stored_mime, uploaded)
+	respond(c, created ? 201 : 200, "application/json", transmute([]u8)desc, false)
 }
 
 // --- helpers --------------------------------------------------------------
 
 @(private = "file")
-write_descriptor :: proc(b: ^strings.Builder, base, hash: string, size: i64, mime: string, uploaded: i64) {
+write_descriptor :: proc(
+	b: ^strings.Builder,
+	base, hash: string,
+	size: i64,
+	mime: string,
+	uploaded: i64,
+) {
 	strings.write_string(b, "{\"url\":")
-	json_write_string(b, strings.concatenate({base, "/", hash}, context.temp_allocator))
+	json_write_string(b, strings.concatenate({base, "/", hash}))
 	strings.write_string(b, ",\"sha256\":")
 	json_write_string(b, hash)
 	strings.write_string(b, ",\"size\":")
@@ -498,15 +505,15 @@ write_descriptor :: proc(b: ^strings.Builder, base, hash: string, size: i64, mim
 
 @(private = "file")
 blob_descriptor :: proc(base, hash: string, size: i64, mime: string, uploaded: i64) -> string {
-	b := strings.builder_make(context.temp_allocator)
+	b := strings.builder_make()
 	write_descriptor(&b, base, hash, size, mime, uploaded)
 	return strings.to_string(b)
 }
 
 @(private = "file")
 itoa :: proc(v: i64) -> string {
-	buf := make([]u8, 24, context.temp_allocator)
-	return strconv.itoa(buf, int(v))
+	buf := make([]u8, 24)
+	return strconv.write_int(buf, v, 10)
 }
 
 // Parse "bytes=start-end" against a known total size. Supports "a-b", "a-",
@@ -561,7 +568,6 @@ parse_range :: proc(h: string, size: i64) -> (start: i64, end: i64, ok: bool) {
 }
 
 // Minimal magic-number content sniffing for common blob types.
-@(private = "file")
 sniff_mime :: proc(d: []u8) -> string {
 	if len(d) >= 8 && d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G' {
 		return "image/png"
